@@ -6,6 +6,8 @@ The application/server logic is Python. As in the original project, proxy crypto
 
 ## Deploy on a Linux VPS with Docker
 
+The filename `streamlit_app.py` is the requested entry-point name; it is not a Streamlit application. Run it with Python or the supplied Docker image, not `streamlit run`. If opened with Streamlit, it displays deployment instructions without starting any engines. This prevents repeated core launches and the `set_wakeup_fd only works in main thread of the main interpreter` error from Streamlit's script threads.
+
 Use a Linux VPS with Docker Engine and Compose v2. Copy this project's contents to a directory on the VPS, then:
 
 ```bash
