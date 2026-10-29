@@ -388,6 +388,14 @@ function bkOnReplit() {
 function bkOnRailway() {
   return !!(process.env.RAILWAY_PROJECT_ID || process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_SERVICE_ID || process.env.RAILWAY_PUBLIC_DOMAIN);
 }
+function bkFlag(name, fallback) {
+  return process.env[name] === undefined ? fallback : /^(true|1|yes|on)$/i.test(process.env[name]);
+}
+function bkIpv4Only() {
+  // Containers without a public IPv6 interface cannot normally dial IPv6.
+  const hasIpv6 = Object.values(os.networkInterfaces()).flat().some(item => item && !item.internal && (item.family === 'IPv6' || item.family === 6) && /^[23]/.test(item.address));
+  return bkFlag('BK_IPV4_ONLY', !hasIpv6);
+}
 /** Replit / Railway: public edge terminates TLS on 443 and forwards plain HTTP to PORT. */
 function bkOnEdgeHost() { return bkOnReplit() || bkOnRailway(); }
 function bkPlatformName() { return bkOnReplit() ? 'Replit' : (bkOnRailway() ? 'Railway' : 'Self-hosted'); }
@@ -1684,7 +1692,7 @@ class SingBoxEngine {
       },
       inbounds,
       outbounds: [
-        { type: 'direct', tag: 'direct', ...(process.env.BK_IPV4_ONLY === 'true' ? { domain_strategy: 'ipv4_only' } : {}) },
+        { type: 'direct', tag: 'direct', ...(bkIpv4Only() ? { domain_strategy: 'ipv4_only' } : {}) },
         { type: 'block', tag: 'block' }
       ],
       route: {
@@ -1926,7 +1934,7 @@ class XrayEngine {
       log: { loglevel: 'warning' },
       inbounds,
       outbounds: [
-        { protocol: 'freedom', tag: 'direct', ...(process.env.BK_IPV4_ONLY === 'true' ? { streamSettings: { sockopt: { domainStrategy: 'ForceIPv4' } } } : {}) },
+        { protocol: 'freedom', tag: 'direct', ...(bkIpv4Only() ? { streamSettings: { sockopt: { domainStrategy: 'ForceIPv4' } } } : {}) },
         { protocol: 'blackhole', tag: 'block' }
       ]
     };
@@ -2233,7 +2241,7 @@ class LinkGenerator {
     this.state = state;
     this.host = config.forceHost || resolvedHost || config.domain || '127.0.0.1';
     // BK_FIX2_APPLIED
-    const bkOnRailway = bkOnEdgeHost(); // Replit or Railway: only HTTPS on 443 is public
+    const bkOnRailway = bkOnEdgeHost() || /\.hostless\.app$/i.test(this.host); // HTTPS edges expose 443, not the container port
     this.port = parseInt(process.env.LINK_PORT || '', 10) || (bkOnRailway ? 443 : config.publicPort);
     // Railway's edge only accepts HTTPS on 443 and forwards plain HTTP to $PORT, so on Railway every
     // WS/HTTPUpgrade link is TLS (edge-side) and plain "security=none" links are not generated.
@@ -4523,7 +4531,7 @@ async function resolvePublicHost(config, savedHost) {
 // Probe local TCP listeners, not external websites: remote outages must not
 // restart working engines. Existing exit handlers retain bounded crash retries.
 function startEngineWatchdog(engine, label, inbounds) {
-  if (process.env.ENGINE_WATCHDOG !== 'true') return () => {};
+  if (!bkFlag('ENGINE_WATCHDOG', true)) return () => {};
   const ports = [...new Set(inbounds.filter(ib => ib.listen === '127.0.0.1' && ib.listen_port && ib.network !== 'udp' && !['hysteria2', 'tuic'].includes(ib.type)).map(ib => ib.listen_port))];
   if (!ports.length) return () => {};
   let busy = false, failures = 0, lastChild = null, stopped = false;
@@ -4564,20 +4572,24 @@ function startEngineWatchdog(engine, label, inbounds) {
   return () => { stopped = true; clearInterval(timer); };
 }
 
-function startSelfPing(config) {
-  if (process.env.SELF_PING !== 'true') return () => {};
-  let url;
-  try {
-    const base = new URL(config.publicBaseUrl);
-    if (!['http:', 'https:'].includes(base.protocol)) throw new Error('HTTP(S) URL required');
-    url = new URL(`/${config.panelPath}/login`, base).href;
-  } catch (_) {
-    Logger.warn('Self-ping disabled: set PUBLIC_BASE_URL to the public HTTPS URL.');
-    return () => {};
-  }
+function startSelfPing(config, getLearnedHost = () => '') {
+  if (!bkFlag('SELF_PING', true)) return () => {};
   let pending = false;
   const timer = setInterval(async () => {
     if (pending) return;
+    let url;
+    try {
+      let baseUrl = config.publicBaseUrl;
+      if (!baseUrl) {
+        const host = normalizeHost(config.forceHost || config.domain || getLearnedHost());
+        if (!host || isIpLiteral(host) || host === 'localhost') return; // wait for the first public panel request
+        const links = new LinkGenerator(config, {}, host);
+        baseUrl = `${links.edgeTls ? 'https' : 'http'}://${host}:${links.port}`;
+      }
+      const base = new URL(baseUrl);
+      if (!['http:', 'https:'].includes(base.protocol)) throw new Error('HTTP(S) URL required');
+      url = new URL(`/${config.panelPath}/login`, base).href;
+    } catch (_) { return; }
     pending = true;
     try { await axios.get(url, { timeout: 10000, maxRedirects: 0 }); }
     catch (err) { Logger.warn(`Self-ping failed: ${err.message}`); }
@@ -4713,8 +4725,8 @@ async function startGate(userConfig = {}) {
   const { server: expressServer, app: expressApp } = createHttpPanel(config, stateMgr, engineStatusGetter, () => resolvedHost);
   const tcpRouter = new TcpRouter(config, allocatedPorts, expressServer, expressApp);
   await tcpRouter.start();
-  const stopSelfPing = startSelfPing(config);
-  if (process.env.BK_IPV4_ONLY === 'true') Logger.info('IPv4-only domain resolution enabled for proxy outbounds.');
+  const stopSelfPing = startSelfPing(config, () => stateMgr.state.publicHost || '');
+  if (bkIpv4Only()) Logger.info('IPv4-only domain resolution enabled for proxy outbounds (automatic or configured).');
 
   // 10. Summary
   const panelUrl = (config.forceHttps || bkOnEdgeHost()) && !isIpLiteral(resolvedHost)
