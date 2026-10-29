@@ -1684,7 +1684,7 @@ class SingBoxEngine {
       },
       inbounds,
       outbounds: [
-        { type: 'direct', tag: 'direct' },
+        { type: 'direct', tag: 'direct', ...(process.env.BK_IPV4_ONLY === 'true' ? { domain_strategy: 'ipv4_only' } : {}) },
         { type: 'block', tag: 'block' }
       ],
       route: {
@@ -1803,10 +1803,12 @@ class SingBoxEngine {
 
     this._spawn();
     this._probeInbounds(configData);
+    this._stopWatchdog = startEngineWatchdog(this, 'sing-box', configData.inbounds);
     return true;
   }
 
   _spawn() {
+    const spawnedAt = Date.now();
     try {
       if (fs.existsSync(this.paths.singboxLog) && fs.statSync(this.paths.singboxLog).size > 5 * 1024 * 1024) {
         fs.truncateSync(this.paths.singboxLog, 0);
@@ -1841,7 +1843,7 @@ class SingBoxEngine {
       try { fs.closeSync(logFd); } catch {}
       if (this._stopping) return;
       Logger.warn(`sing-box exited with code ${code} (${sig || 'none'})`);
-      this._restarts = (this._restarts || 0) + 1;
+      this._restarts = (Date.now() - spawnedAt >= 300000 ? 0 : (this._restarts || 0)) + 1;
       if (this._restarts <= 20) {
         const delay = Math.min(30000, 1000 * this._restarts);
         Logger.warn(`Restarting sing-box in ${delay / 1000}s (attempt ${this._restarts})...`);
@@ -1867,6 +1869,7 @@ class SingBoxEngine {
 
   stop() {
     this._stopping = true;
+    if (this._stopWatchdog) this._stopWatchdog();
     if (this.process && !this.process.killed) {
       try {
         this.process.kill('SIGTERM');
@@ -1923,7 +1926,7 @@ class XrayEngine {
       log: { loglevel: 'warning' },
       inbounds,
       outbounds: [
-        { protocol: 'freedom', tag: 'direct' },
+        { protocol: 'freedom', tag: 'direct', ...(process.env.BK_IPV4_ONLY === 'true' ? { streamSettings: { sockopt: { domainStrategy: 'ForceIPv4' } } } : {}) },
         { protocol: 'blackhole', tag: 'block' }
       ]
     };
@@ -1944,10 +1947,12 @@ class XrayEngine {
     }
     this._spawn();
     this._probe();
+    this._stopWatchdog = startEngineWatchdog(this, 'Xray-core', this.buildConfig().inbounds.map(ib => ({ listen: ib.listen, listen_port: ib.port })));
     return true;
   }
 
   _spawn() {
+    const spawnedAt = Date.now();
     try {
       if (fs.existsSync(this.paths.xrayLog) && fs.statSync(this.paths.xrayLog).size > 5 * 1024 * 1024) fs.truncateSync(this.paths.xrayLog, 0);
     } catch (_) {}
@@ -1973,7 +1978,7 @@ class XrayEngine {
       try { fs.closeSync(logFd); } catch (_) {}
       if (this._stopping) return;
       Logger.warn(`Xray-core exited with code ${code} (${sig || 'none'})`);
-      this._restarts = (this._restarts || 0) + 1;
+      this._restarts = (Date.now() - spawnedAt >= 300000 ? 0 : (this._restarts || 0)) + 1;
       if (this._restarts <= 20) {
         const delay = Math.min(30000, 1000 * this._restarts);
         Logger.warn(`Restarting Xray-core in ${delay / 1000}s (attempt ${this._restarts})...`);
@@ -1999,6 +2004,7 @@ class XrayEngine {
 
   stop() {
     this._stopping = true;
+    if (this._stopWatchdog) this._stopWatchdog();
     if (this.process && !this.process.killed) {
       try { this.process.kill('SIGTERM'); } catch (_) {}
     }
@@ -4514,6 +4520,74 @@ async function resolvePublicHost(config, savedHost) {
   return '127.0.0.1';
 }
 
+// Probe local TCP listeners, not external websites: remote outages must not
+// restart working engines. Existing exit handlers retain bounded crash retries.
+function startEngineWatchdog(engine, label, inbounds) {
+  if (process.env.ENGINE_WATCHDOG !== 'true') return () => {};
+  const ports = [...new Set(inbounds.filter(ib => ib.listen === '127.0.0.1' && ib.listen_port && ib.network !== 'udp' && !['hysteria2', 'tuic'].includes(ib.type)).map(ib => ib.listen_port))];
+  if (!ports.length) return () => {};
+  let busy = false, failures = 0, lastChild = null, stopped = false;
+  const check = () => new Promise(resolve => {
+    Promise.all(ports.map(port => new Promise(done => {
+      const sock = net.connect(port, '127.0.0.1');
+      const finish = ok => { sock.destroy(); done(ok); };
+      sock.setTimeout(3000);
+      sock.once('connect', () => finish(true));
+      sock.once('error', () => finish(false));
+      sock.once('timeout', () => finish(false));
+    }))).then(results => resolve(results.every(Boolean)));
+  });
+  const timer = setInterval(async () => {
+    const child = engine.process;
+    if (busy || stopped || engine._stopping || !child || child.killed || child.exitCode !== null || child.signalCode !== null) return;
+    if (lastChild !== child) { failures = 0; lastChild = child; }
+    busy = true;
+    try {
+      const healthy = await check();
+      if (stopped || engine._stopping || child !== engine.process) return;
+      failures = healthy ? 0 : failures + 1;
+      if (failures >= 3) {
+        failures = 0;
+        Logger.warn(`${label} watchdog: local listeners failed 3 checks; restarting engine.`);
+        child.kill('SIGTERM');
+        const force = setTimeout(() => {
+          if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+        }, 5000);
+        force.unref();
+      }
+    } catch (err) {
+      Logger.warn(`${label} watchdog: ${err.message}`);
+    } finally { busy = false; }
+  }, 60000);
+  timer.unref();
+  Logger.info(`${label} watchdog enabled (60s checks, restart after 3 failures).`);
+  return () => { stopped = true; clearInterval(timer); };
+}
+
+function startSelfPing(config) {
+  if (process.env.SELF_PING !== 'true') return () => {};
+  let url;
+  try {
+    const base = new URL(config.publicBaseUrl);
+    if (!['http:', 'https:'].includes(base.protocol)) throw new Error('HTTP(S) URL required');
+    url = new URL(`/${config.panelPath}/login`, base).href;
+  } catch (_) {
+    Logger.warn('Self-ping disabled: set PUBLIC_BASE_URL to the public HTTPS URL.');
+    return () => {};
+  }
+  let pending = false;
+  const timer = setInterval(async () => {
+    if (pending) return;
+    pending = true;
+    try { await axios.get(url, { timeout: 10000, maxRedirects: 0 }); }
+    catch (err) { Logger.warn(`Self-ping failed: ${err.message}`); }
+    finally { pending = false; }
+  }, 15 * 60 * 1000);
+  timer.unref();
+  Logger.info('Self-ping enabled every 15 minutes (cannot wake a suspended container).');
+  return () => clearInterval(timer);
+}
+
 async function startGate(userConfig = {}) {
   // 1. Banner & notices
   Logger.banner();
@@ -4629,15 +4703,18 @@ async function startGate(userConfig = {}) {
   stateMgr.setLinks(links, clashYaml, singboxJson);
 
   // 9. HTTP Panel & TCP multiplexer
+  const engineRunning = engine => !!(engine && engine.process && !engine.process.killed && engine.process.exitCode === null && engine.process.signalCode === null);
   const engineStatusGetter = () => ({
-    singbox: !!(singboxInstance && singboxInstance.process && !singboxInstance.process.killed),
-    xray: !!(xrayInstance && xrayInstance.process && !xrayInstance.process.killed),
-    argo: !!(argoInstance && argoInstance.process && !argoInstance.process.killed)
+    singbox: engineRunning(singboxInstance),
+    xray: engineRunning(xrayInstance),
+    argo: engineRunning(argoInstance)
   });
 
   const { server: expressServer, app: expressApp } = createHttpPanel(config, stateMgr, engineStatusGetter, () => resolvedHost);
   const tcpRouter = new TcpRouter(config, allocatedPorts, expressServer, expressApp);
   await tcpRouter.start();
+  const stopSelfPing = startSelfPing(config);
+  if (process.env.BK_IPV4_ONLY === 'true') Logger.info('IPv4-only domain resolution enabled for proxy outbounds.');
 
   // 10. Summary
   const panelUrl = (config.forceHttps || bkOnEdgeHost()) && !isIpLiteral(resolvedHost)
@@ -4652,6 +4729,7 @@ async function startGate(userConfig = {}) {
   // Graceful shutdown
   const shutdown = () => {
     Logger.info('Stopping Blue Knight Gate...');
+    stopSelfPing();
     if (singboxInstance) singboxInstance.stop();
     if (xrayInstance) xrayInstance.stop();
     if (argoInstance) argoInstance.stop();
