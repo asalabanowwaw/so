@@ -1,0 +1,31 @@
+name: Hostless availability check
+
+on:
+  schedule:
+    - cron: '3,13,23,33,43,53 * * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/hostless-keepalive.yml']
+
+permissions: {}
+
+concurrency:
+  group: hostless-availability
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Request the public panel from outside Hostless
+        shell: bash
+        run: |
+          url="https://diana635496.hostless.app/knight/login?_bk_external=$(date +%s)"
+          status=$(curl --silent --show-error --output /dev/null \
+            --write-out '%{http_code}' --connect-timeout 15 --max-time 60 \
+            --retry 2 --retry-delay 10 --retry-max-time 220 \
+            --header 'Cache-Control: no-cache, no-store' "$url")
+          echo "Public panel HTTP status: $status"
+          test "$status" = 200
