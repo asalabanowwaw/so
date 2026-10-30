@@ -34,6 +34,19 @@ Generated `*.deploy.meerasolution.com` and `*.ms-host.com` app domains are recog
 
 The [container workflow](.github/workflows/container-check.yml) builds the image on Linux, waits for the login page, and checks sing-box/Xray listeners. Building an image successfully is separate from confirming the hosting provider supports the proxy transports.
 
+## Experimental IP Scanner tab
+
+After deploying, open **Scanner** in the panel. It uses the public domain learned by this deployment; there is no fixed app hostname in the scanner.
+
+1. Leave DNS discovery checked to collect public A/AAAA answers from system DNS, Cloudflare, and Google.
+2. Optionally paste known public ingress IPs, one per line. The scan accepts at most 32 individual addresses, tests three concurrently, and uses port 443 only. Private addresses and CIDR ranges are not accepted.
+3. Select **Start scan**. Each candidate must pass certificate validation with the app's TLS SNI, a WebSocket upgrade with the app's Host header, and an authenticated VLESS request to `example.com`.
+4. Copy configs from verified results. The connection address becomes the IP while TLS SNI and WebSocket Host retain your app domain. Choose VLESS, VMess, or Trojan WS TLS in the result protocol selector; VLESS is the protocol tested end to end, while the other exports require their respective engine listeners.
+
+This is a reachability test **from the hosting server**, not an ISP filtering test from your phone or computer. A host may expose only one working ingress IP, and an address that works on the server may fail from your network. The scanner does not invent extra addresses or bypass domain-based routing requirements. Results are temporary and do not replace the main subscription automatically.
+
+The scanner requires panel login and VLESS WS/TLS enabled on public port 443. No additional service key is needed. Use **Cancel** to stop an active scan.
+
 ## Channels
 
 - [YouTube · BlueKnight-Net](https://www.youtube.com/@BlueKnight-Net)

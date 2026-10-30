@@ -9,6 +9,7 @@ on:
       - index.js
       - package.json
       - package-lock.json
+      - tests/**
       - .github/workflows/container-check.yml
   workflow_dispatch:
 
@@ -21,6 +22,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - name: Check scanner validation and protocol handling
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          node tests/scanner.cjs
       - name: Build the plain Node.js image
         run: docker build -t blue-knight-smoke .
       - name: Start the panel
