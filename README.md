@@ -26,7 +26,9 @@ The image installs production npm dependencies and archive tools, then runs as t
 
 Open `https://YOUR-APP-DOMAIN/knight` to create the password, then refresh the subscription. The panel learns the public hostname from the request. It does not contain a fixed Meera application domain. Keep `/data` persistent to preserve the UUID, password, subscription token, certificates, and engine files.
 
-Alternatively, choose the platform's **Node.js** framework, start with `npm start`, and configure its internal port plus `LINK_TLS=true` and `LINK_PORT=443` for HTTPS-edge access. Do not select Next.js or add a fake build script to bypass its template.
+Alternatively, choose the platform's **Node.js** framework, start with `npm start`, and match the platform's internal port to the app's `PORT` value. Do not select Next.js or add a fake build script to bypass its template.
+
+Generated `*.deploy.meerasolution.com` and `*.ms-host.com` app domains are recognized automatically: client configs use public HTTPS/TLS on **443**, independently of the internal port, and omit the panel's internal certificate pin. Refresh the subscription after deploying this version. For a custom domain, set `LINK_TLS=true` and `LINK_PORT=443` explicitly. Remove or correct stale overrides such as `LINK_PORT=8080`, which take priority over automatic detection.
 
 ## Container checks
 

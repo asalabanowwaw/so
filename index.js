@@ -398,6 +398,9 @@ function bkIpv4Only() {
 }
 /** Replit / Railway: public edge terminates TLS on 443 and forwards plain HTTP to PORT. */
 function bkOnEdgeHost() { return bkOnReplit() || bkOnRailway(); }
+function bkUsesManagedHttps(host) {
+  return bkOnEdgeHost() || /\.(hostless\.app|deploy\.meerasolution\.com|ms-host\.com)$/i.test(normalizeHost(host));
+}
 function bkPlatformName() { return bkOnReplit() ? 'Replit' : (bkOnRailway() ? 'Railway' : 'Self-hosted'); }
 /** Published Replit app domain from REPLIT_DOMAINS (custom domain first, then *.replit.app; never the private *.replit.dev). */
 function bkReplitDomain() {
@@ -406,7 +409,7 @@ function bkReplitDomain() {
   return list.find((d) => !d.endsWith('.replit.app') && !d.endsWith('.replit.dev')) || list.find((d) => d.endsWith('.replit.app')) || '';
 }
 /** Platform default hostnames: a relay / custom domain the visitor used beats these. */
-function bkIsPlatformHost(h) { return /(^|\.)(up\.railway\.app|replit\.app|replit\.dev)$/.test(String(h || '')); }
+function bkIsPlatformHost(h) { return /(^|\.)(up\.railway\.app|replit\.app|replit\.dev|hostless\.app|deploy\.meerasolution\.com|ms-host\.com)$/.test(String(h || '')); }
 /** Normalize "https://Name.example.com:443/path" -> "name.example.com" (IPv6 literals kept). */
 function normalizeHost(v) {
   let h = String(v || '').trim();
@@ -2246,14 +2249,14 @@ class LinkGenerator {
     this.state = state;
     this.host = config.forceHost || resolvedHost || config.domain || '127.0.0.1';
     // BK_FIX2_APPLIED
-    const bkOnRailway = bkOnEdgeHost() || /\.hostless\.app$/i.test(this.host); // HTTPS edges expose 443, not the container port
-    this.port = parseInt(process.env.LINK_PORT || '', 10) || (bkOnRailway ? 443 : config.publicPort);
-    // Railway's edge only accepts HTTPS on 443 and forwards plain HTTP to $PORT, so on Railway every
-    // WS/HTTPUpgrade link is TLS (edge-side) and plain "security=none" links are not generated.
+    const managedEdge = bkUsesManagedHttps(this.host);
+    this.port = parseInt(process.env.LINK_PORT || '', 10) || (managedEdge ? 443 : config.publicPort);
+    // Managed HTTPS edges terminate public TLS and forward to the internal
+    // PORT. Their public certificate must not use the panel's internal pin.
     // LINK_TLS=true|false overrides the detection.
     this.edgeTls = process.env.LINK_TLS !== undefined
       ? (process.env.LINK_TLS === 'true' || process.env.LINK_TLS === '1')
-      : (bkOnRailway && this.port === 443);
+      : (managedEdge && this.port === 443);
     // Railway's edge serves a valid public certificate: never ask clients to skip verification there
     // (Xray-core >= 26.x removed allowInsecure; links carrying it can fail to load in new clients).
     this.insecure = !this.edgeTls;
