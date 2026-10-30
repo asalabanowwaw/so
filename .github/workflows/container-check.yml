@@ -1,0 +1,67 @@
+name: Container build and startup check
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - index.js
+      - package.json
+      - package-lock.json
+      - .github/workflows/container-check.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the plain Node.js image
+        run: docker build -t blue-knight-smoke .
+      - name: Start the panel
+        run: docker run -d --name panel-smoke --memory=512m -p 127.0.0.1:18080:3000 blue-knight-smoke
+      - name: Wait for the login page
+        shell: bash
+        run: |
+          for attempt in $(seq 1 90); do
+            status=$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 2 http://127.0.0.1:18080/knight/login || true)
+            if [ "$status" = 200 ]; then exit 0; fi
+            if [ "$(docker inspect -f '{{.State.Running}}' panel-smoke)" != true ]; then break; fi
+            sleep 2
+          done
+          echo 'Panel did not become ready.' >&2
+          exit 1
+      - name: Check native engine listeners
+        run: |
+          docker exec -i panel-smoke node <<'NODE'
+          const fs = require('node:fs');
+          const net = require('node:net');
+          const sb = JSON.parse(fs.readFileSync('/data/sing-box.json', 'utf8'));
+          const xr = JSON.parse(fs.readFileSync('/data/xray.json', 'utf8'));
+          const ports = [
+            ...sb.inbounds.filter(i => i.transport && i.transport.type === 'ws').map(i => i.listen_port),
+            ...xr.inbounds.map(i => i.port)
+          ];
+          if (!ports.length || !xr.inbounds.length) throw new Error('Proxy engine configs are missing.');
+          Promise.all(ports.map(port => new Promise((resolve, reject) => {
+            const socket = net.connect(port, '127.0.0.1');
+            socket.setTimeout(3000);
+            socket.once('connect', () => { socket.destroy(); resolve(); });
+            socket.once('error', reject);
+            socket.once('timeout', () => { socket.destroy(); reject(new Error('Engine listener timed out')); });
+          }))).then(() => console.log('Panel and native engine listeners are ready.')).catch(error => {
+            console.error(error.message);
+            process.exitCode = 1;
+          });
+          NODE
+      - name: Runtime diagnostics
+        if: always()
+        run: docker logs panel-smoke || true
+      - name: Clean up
+        if: always()
+        run: docker rm -f panel-smoke || true

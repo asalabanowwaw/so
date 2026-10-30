@@ -1,0 +1,7 @@
+# This standalone panel embeds its assets in index.js.
+**
+!Dockerfile
+!.dockerignore
+!package.json
+!package-lock.json
+!index.js
